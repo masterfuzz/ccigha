@@ -1,17 +1,9 @@
 import os
-import sys
 import ruamel.yaml
 
 ruamel.yaml.representer.RoundTripRepresenter.ignore_aliases = lambda x, y: True
 from ruamel.yaml import YAML
 import re
-
-SSH_ACTION = [
-    {
-        "uses": "./.github/actions/configure-ssh",
-        "with": {"ssh-private-key": "${{ secrets.TETRATE_CI_SSH_PRIVATE_KEY }}"},
-    },
-]
 
 
 def replace_parameters(string, parameters) -> str:
@@ -51,6 +43,7 @@ class Converter:
         self.cci_commands = self.cci_pipeline["commands"]
         self.cci_job_templates = self.cci_pipeline["jobs"]
         self.cci_executors = self.cci_pipeline["executors"]
+        self.ssh_key = None
 
     @staticmethod
     def load(fh):
@@ -182,7 +175,7 @@ class Converter:
                     # return expand_command(step, workflow_parameters, job_parameters, {})
                     return [{"uses": f"./.github/actions/{step}"}]
                 case "checkout":
-                    return [{"uses": "actions/checkout@v3"}] + SSH_ACTION.copy()
+                    return [{"uses": "actions/checkout@v3"}] + self.ssh_action()
                 case _:
                     print(f"?? {step}")
                     return []
@@ -293,12 +286,39 @@ class Converter:
         with open(os.path.join(action_dir, "action.yaml"), "w") as fh:
             YAML().dump(action, fh)
 
+    def ssh_action(self):
+        return (
+            [
+                {
+                    "uses": "./.github/actions/configure-ssh",
+                    "with": {"ssh-private-key": f"${{{{ secrets.{self.ssh_key} }}}}"},
+                },
+            ]
+            if self.ssh_key
+            else []
+        )
+
 
 if __name__ == "__main__":
-    cci_workflow_file, github_directory = sys.argv[1:3]
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workflow_file", help="Path to CircleCI workflow file")
+    ap.add_argument("github_directory", help="Path to a .github directory for export")
+    ap.add_argument(
+        "-s",
+        "--ssh-key",
+        default=None,
+        help="Name of a github secret for injecting ssh private key",
+    )
+    ap.add_argument("filter", nargs="*", help="Optional allowlist of jobs for export")
+    args = ap.parse_args()
+
+    cci_workflow_file = args.workflow_file
+    github_directory = args.github_directory
     print(f"Load circle ci workflow file from {cci_workflow_file}")
     with open(cci_workflow_file) as fh:
         converter = Converter.load(fh)
-
-    converter.export(github_directory, sys.argv[3:])
+    converter.ssh_key = args.ssh_key
+    converter.export(github_directory, args.filter)
     print("done")
