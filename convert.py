@@ -44,6 +44,7 @@ class Converter:
         self.cci_job_templates = self.cci_pipeline["jobs"]
         self.cci_executors = self.cci_pipeline["executors"]
         self.ssh_key = None
+        self.runs_on = "ubuntu-latest"
 
     @staticmethod
     def load(fh):
@@ -54,6 +55,8 @@ class Converter:
             f"Writing converting commands to actions and writing to {github_directory}/actions"
         )
         for command in self.cci_commands:
+            if command == "early-terminate":
+                continue
             self.write_command(command, github_directory)
 
         for wf_name, workflow in self.cci_workflows.items():
@@ -63,11 +66,7 @@ class Converter:
             gh_workflow = self.convert_workflow(wf_name, workflow)
 
             if filter:
-                gh_workflow["jobs"] = {
-                    name: job
-                    for name, job in gh_workflow["jobs"].items()
-                    if name in filter
-                }
+                gh_workflow = self.filter_workflow(gh_workflow, filter)
             fpath = os.path.join(
                 github_directory,
                 "workflows",
@@ -93,7 +92,7 @@ class Converter:
                 "pull_request": {"branches": ["master"]},
                 "workflow_dispatch": {},
             },
-            "permissions": {"contents": "read"},
+            "permissions": {"contents": "read", "actions": "write"},
             "jobs": gh_jobs,
         }
 
@@ -109,7 +108,7 @@ class Converter:
         name = cci_job.get("name", template_name)
         gh_job = {
             "name": name,
-            "runs-on": "ubuntu-latest",
+            "runs-on": self.runs_on,
         }
         self.expand_template(gh_job, template_name, parameters, cci_job)
         if executor := self.cci_job_templates[template_name].get("executor"):
@@ -166,13 +165,20 @@ class Converter:
         parent_step_parameters=None,
         conditional=None,
     ):
-        # if step.split('/')[0] in cci_orbs:
         if type(step) == str:
             match step:
+                case "early-terminate":
+                    return [
+                        {
+                            "name": "Early terminate",
+                            "run": "gh run cancel ${{ github.run_id }} && gh run watch ${{ github.run_id }}",
+                            "shell": "sh",
+                            "env": {"GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"},
+                        }
+                    ]
                 case _ if "/" in step:
                     return [{"uses": step}]  # is orb
                 case _ if step in self.cci_commands:
-                    # return expand_command(step, workflow_parameters, job_parameters, {})
                     return [{"uses": f"./.github/actions/{step}"}]
                 case "checkout":
                     return [{"uses": "actions/checkout@v3"}] + self.ssh_action()
@@ -286,6 +292,21 @@ class Converter:
         with open(os.path.join(action_dir, "action.yaml"), "w") as fh:
             YAML().dump(action, fh)
 
+    def filter_workflow(self, gh_workflow, filter):
+        def transitive_dependents(of):
+            yield of
+            if deps := gh_workflow["jobs"][of].get("needs"):
+                for dep in deps:
+                    yield from transitive_dependents(dep)
+
+        filter = set(d for f in filter for d in transitive_dependents(f))
+
+        gh_workflow = gh_workflow.copy()
+        gh_workflow["jobs"] = {
+            name: job for name, job in gh_workflow["jobs"].items() if name in filter
+        }
+        return gh_workflow
+
     def ssh_action(self):
         return (
             [
@@ -311,6 +332,17 @@ if __name__ == "__main__":
         default=None,
         help="Name of a github secret for injecting ssh private key",
     )
+    ap.add_argument(
+        "-r",
+        "--runs-on",
+        help="Override runs-on (defaults to ubuntu-latest)",
+        default="ubuntu-latest",
+    )
+    ap.add_argument(
+        "-R",
+        "--runner-labels",
+        help="Override runs-on with runner labels seperated by commas",
+    )
     ap.add_argument("filter", nargs="*", help="Optional allowlist of jobs for export")
     args = ap.parse_args()
 
@@ -320,5 +352,9 @@ if __name__ == "__main__":
     with open(cci_workflow_file) as fh:
         converter = Converter.load(fh)
     converter.ssh_key = args.ssh_key
+    if args.runner_labels:
+        converter.runs_on = args.runner_labels.split(",")
+    else:
+        converter.runs_on = args.runs_on
     converter.export(github_directory, args.filter)
     print("done")
